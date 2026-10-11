@@ -423,12 +423,14 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .await
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
-                // Update with version check
-                let result = sqlx::query(
+                // Return metadata from this write so a concurrent writer cannot
+                // attach its resource version to our caller's earlier payload.
+                let row = sqlx::query(
                     r#"
 UPDATE "objects"
 SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
 WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -437,11 +439,13 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                 .bind(payload)
                 .bind(labels.unwrap_or("{}"))
                 .bind(now_ms)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                if result.rows_affected() == 0 {
+                if let Some(row) = row {
+                    Ok(row_to_write_result(row))
+                } else {
                     // The version-matched UPDATE matched no row. Distinguish a
                     // version mismatch (row present, different version) from an
                     // absent row (deleted / never existed). Both are CAS
@@ -449,25 +453,14 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                     // rather than a backend-dependent error string: absent rows
                     // carry `current_resource_version: None`.
                     let existing = self.get(object_type, id).await?;
-                    return Err(PersistenceError::Conflict {
+                    Err(PersistenceError::Conflict {
                         current_resource_version: existing.map(|record| record.resource_version),
-                    });
+                    })
                 }
-
-                // Fetch the updated record to get the new resource_version
-                let updated = self.get(object_type, id).await?.ok_or_else(|| {
-                    PersistenceError::Database("object disappeared after update".to_string())
-                })?;
-
-                Ok(WriteResult {
-                    resource_version: updated.resource_version,
-                    created_at_ms: updated.created_at_ms,
-                    updated_at_ms: updated.updated_at_ms,
-                })
             }
             WriteCondition::Unconditional => {
                 // Unconditional upsert by name
-                sqlx::query(
+                let row = sqlx::query(
                     r#"
 INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
@@ -476,6 +469,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
     "updated_at_ms" = excluded."updated_at_ms",
     "labels" = excluded."labels",
     "resource_version" = "objects"."resource_version" + 1
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -485,23 +479,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .bind(payload)
                 .bind(now_ms)
                 .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                // Fetch the result to get the resource_version
-                let record = self
-                    .get_by_name(object_type, workspace, name)
-                    .await?
-                    .ok_or_else(|| {
-                        PersistenceError::Database("object disappeared after upsert".to_string())
-                    })?;
-
-                Ok(WriteResult {
-                    resource_version: record.resource_version,
-                    created_at_ms: record.created_at_ms,
-                    updated_at_ms: record.updated_at_ms,
-                })
+                Ok(row_to_write_result(row))
             }
         }
     }
@@ -1913,6 +1895,15 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [with_suffix("-wal"), with_suffix("-shm")]
 }
 
+fn row_to_write_result(row: sqlx::sqlite::SqliteRow) -> WriteResult {
+    let resource_version_i64: i64 = row.get("resource_version");
+    WriteResult {
+        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+    }
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
     let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
@@ -1955,4 +1946,124 @@ fn row_to_draft_chunk_record(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<
         created_at_ms,
         updated_at_ms,
     )
+}
+
+#[cfg(test)]
+mod write_result_tests {
+    use super::*;
+
+    async fn assert_write_result_survives_concurrent_update(condition: WriteCondition) {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .put_if(
+                "sandbox",
+                "id-1",
+                "sandbox-1",
+                "default",
+                b"initial",
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+            .unwrap();
+
+        // Hold the single pooled connection while both writers queue. Pool
+        // acquisition is FIFO, so B runs after A's write and before any
+        // separate result lookup by A. No sleeps or production hooks needed.
+        let held_connection = store.pool.acquire().await.unwrap();
+        let incoming_id = match condition {
+            WriteCondition::Unconditional => "unused-upsert-id",
+            _ => "id-1",
+        };
+        let mut first_write = std::pin::pin!(store.put_if(
+            "sandbox",
+            incoming_id,
+            "sandbox-1",
+            "default",
+            b"writer-a",
+            None,
+            condition,
+        ));
+        assert!(futures::poll!(&mut first_write).is_pending());
+
+        let mut second_write = std::pin::pin!(async {
+            let mut connection = store.pool.acquire().await.unwrap();
+            let before = row_to_object_record(
+                sqlx::query("SELECT * FROM objects WHERE id = ?1")
+                    .bind("id-1")
+                    .fetch_one(&mut *connection)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(before.resource_version, 2);
+            assert_eq!(before.payload, b"writer-a");
+
+            let result = sqlx::query(
+                "UPDATE objects SET payload = ?1, updated_at_ms = ?2, \
+                 resource_version = resource_version + 1 \
+                 WHERE id = ?3 AND resource_version = ?4",
+            )
+            .bind(b"writer-b".as_slice())
+            .bind(before.updated_at_ms + 1)
+            .bind("id-1")
+            .bind(2_i64)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+            assert_eq!(result.rows_affected(), 1);
+            before
+        });
+        assert!(futures::poll!(&mut second_write).is_pending());
+        drop(held_connection);
+
+        let (first_result, before_second_write) = tokio::join!(&mut first_write, &mut second_write);
+        let first_result = first_result.unwrap();
+        assert_eq!(
+            first_result.resource_version,
+            before_second_write.resource_version
+        );
+        assert_eq!(
+            first_result.created_at_ms,
+            before_second_write.created_at_ms
+        );
+        assert_eq!(
+            first_result.updated_at_ms,
+            before_second_write.updated_at_ms
+        );
+
+        // The returned version must reject a stale follow-up and preserve B.
+        let follow_up = store
+            .put_if(
+                "sandbox",
+                "id-1",
+                "sandbox-1",
+                "default",
+                b"stale-writer-a",
+                None,
+                WriteCondition::MatchResourceVersion(first_result.resource_version),
+            )
+            .await;
+        assert!(matches!(
+            follow_up,
+            Err(PersistenceError::Conflict {
+                current_resource_version: Some(3)
+            })
+        ));
+        let stored = store.get("sandbox", "id-1").await.unwrap().unwrap();
+        assert_eq!(stored.resource_version, 3);
+        assert_eq!(stored.payload, b"writer-b");
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn cas_write_returns_its_own_version_and_timestamps() {
+        assert_write_result_survives_concurrent_update(WriteCondition::MatchResourceVersion(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn unconditional_upsert_returns_its_own_version_and_timestamps() {
+        assert_write_result_survives_concurrent_update(WriteCondition::Unconditional).await;
+    }
 }
